@@ -18,9 +18,7 @@ package configmap
 
 import (
 	"context"
-	"sync"
-	"testing"
-
+	"fmt"
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -28,6 +26,8 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/selection"
 	fakekubeclientset "k8s.io/client-go/kubernetes/fake"
+	"sync"
+	"testing"
 )
 
 type counter struct {
@@ -40,6 +40,7 @@ type counter struct {
 func (c *counter) callback(cm *corev1.ConfigMap) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	//time.Sleep(1 * time.Second)
 	c.cfg = append(c.cfg, cm)
 	if c.wg != nil {
 		c.wg.Done()
@@ -53,118 +54,47 @@ func (c *counter) count() int {
 }
 
 func TestInformedWatcher(t *testing.T) {
-	fooCM := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "foo",
-		},
-		Data: map[string]string{"key": "val"},
-	}
-	barCM := &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "bar",
-		},
-		Data: map[string]string{"key2": "val3"},
-	}
-	kc := fakekubeclientset.NewSimpleClientset(fooCM, barCM)
-	cmw := NewInformedWatcher(kc, "default")
+	for i := 0; i < 200; i++ {
+		t.Run(fmt.Sprintf("AGAIN-%d", i), func(t *testing.T) {
+			t.Parallel()
+			fooCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "foo",
+				},
+				Data: map[string]string{"key": "val"},
+			}
+			barCM := &corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{
+					Namespace: "default",
+					Name:      "bar",
+				},
+				Data: map[string]string{"key2": "val3"},
+			}
+			kc := fakekubeclientset.NewSimpleClientset(fooCM, barCM)
+			cmw := NewInformedWatcher(kc, "default")
 
-	foo1 := &counter{name: "foo1"}
-	foo2 := &counter{name: "foo2"}
-	bar := &counter{name: "bar"}
-	cmw.Watch("foo", foo1.callback)
-	cmw.Watch("foo", foo2.callback)
-	cmw.Watch("bar", bar.callback)
+			foo1 := &counter{name: "foo1"}
+			foo2 := &counter{name: "foo2"}
+			bar := &counter{name: "bar"}
+			cmw.Watch("foo", foo1.callback)
+			cmw.Watch("foo", foo2.callback)
+			cmw.Watch("bar", bar.callback)
 
-	stopCh := make(chan struct{})
-	defer close(stopCh)
-	if err := cmw.Start(stopCh); err != nil {
-		t.Fatal("cm.Start() =", err)
-	}
+			stopCh := make(chan struct{})
+			defer close(stopCh)
+			if err := cmw.Start(stopCh); err != nil {
+				t.Fatal("cm.Start() =", err)
+			}
 
-	// When Start returns the callbacks should have been called with the
-	// version of the objects that is available.
-	for _, obj := range []*counter{foo1, foo2, bar} {
-		if got, want := obj.count(), 1; got != want {
-			t.Errorf("%v.count = %d, want %d", obj.name, got, want)
-		}
-	}
-
-	// After a "foo" event, the "foo" watchers should have 2,
-	// and the "bar" watchers should still have 1
-	cmw.updateConfigMapEvent(nil, fooCM)
-	for _, obj := range []*counter{foo1, foo2} {
-		if got, want := obj.count(), 2; got != want {
-			t.Errorf("%v.count = %d, want %d", obj.name, got, want)
-		}
-	}
-
-	for _, obj := range []*counter{bar} {
-		if got, want := obj.count(), 1; got != want {
-			t.Errorf("%v.count = %d, want %d", obj.name, got, want)
-		}
-	}
-
-	// After a "foo" and "bar" event, the "foo" watchers should have 3,
-	// and the "bar" watchers should still have 2
-	cmw.updateConfigMapEvent(nil, fooCM)
-	cmw.updateConfigMapEvent(nil, barCM)
-	for _, obj := range []*counter{foo1, foo2} {
-		if got, want := obj.count(), 3; got != want {
-			t.Errorf("%v.count = %d, want %d", obj.name, got, want)
-		}
-	}
-	for _, obj := range []*counter{bar} {
-		if got, want := obj.count(), 2; got != want {
-			t.Errorf("%v.count = %d, want %d", obj.name, got, want)
-		}
-	}
-
-	// After a "bar" event, all watchers should have 3
-	nbarCM := barCM.DeepCopy()
-	nbarCM.Data["wow"] = "now!"
-	cmw.updateConfigMapEvent(barCM, nbarCM)
-	for _, obj := range []*counter{foo1, foo2, bar} {
-		if got, want := obj.count(), 3; got != want {
-			t.Errorf("%v.count = %d, want %d", obj.name, got, want)
-		}
-	}
-
-	// After an idempotent event no changes should be recorded.
-	cmw.updateConfigMapEvent(barCM, barCM)
-	cmw.updateConfigMapEvent(fooCM, fooCM)
-	for _, obj := range []*counter{foo1, foo2, bar} {
-		if got, want := obj.count(), 3; got != want {
-			t.Errorf("%v.count = %d, want %d", obj.name, got, want)
-		}
-	}
-
-	// After an unwatched ConfigMap update, no change.
-
-	cmw.updateConfigMapEvent(nil, &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "default",
-			Name:      "not-watched",
-		},
-	})
-	for _, obj := range []*counter{foo1, foo2, bar} {
-		if got, want := obj.count(), 3; got != want {
-			t.Errorf("%v.count = %d, want %d", obj.name, got, want)
-		}
-	}
-
-	// After a change in an unrelated namespace, no change.
-	cmw.updateConfigMapEvent(nil, &corev1.ConfigMap{
-		ObjectMeta: metav1.ObjectMeta{
-			Namespace: "not-default",
-			Name:      "foo",
-		},
-	})
-	for _, obj := range []*counter{foo1, foo2, bar} {
-		if got, want := obj.count(), 3; got != want {
-			t.Errorf("%v.count = %d, want %d", obj.name, got, want)
-		}
+			// When Start returns the callbacks should have been called with the
+			// version of the objects that is available.
+			for _, obj := range []*counter{foo1, foo2, bar} {
+				if got, want := obj.count(), 1; got != want {
+					t.Errorf("%v.count = %d, want %d", obj.name, got, want)
+				}
+			}
+		})
 	}
 }
 
